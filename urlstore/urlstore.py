@@ -1,5 +1,13 @@
 #!/usr/bin/env python
 
+"""
+  TODO:
+    - Store link to response if we were redirected. For instance if requesting
+      cnn.com takes us to www.cnn.com, we should hash the response under the
+      final url, but store a link from cnn.com to www.cnn.com so it's still
+      discoverable.
+"""
+
 import hashlib
 import json
 import logging
@@ -10,7 +18,7 @@ import urllib
 import urllib2
 import urlparse
 
-URL_DIR = '/var/hudl/urls'
+class CacheEntryError(Exception): pass
 
 class Response:
   def __init__(self, url, headers, data):
@@ -18,10 +26,35 @@ class Response:
     self.headers = headers
     self.data = data
 
+
+class UrlLink:
+
+  def __init__(self, cache_dir):
+    self.cache_dir = cache_dir
+    self.link_dir = os.path.join(cache_dir, '.links')
+    if not os.path.exists(self.link_dir):
+      os.makedirs(self.link_dir)
+
+  def add(self, orig, final):
+    orig = UrlStore.hashurl(orig)
+    final = UrlStore.hashurl(final)
+    with open(orig, 'wb') as f:
+      f.write(final)
+
+  def all(self):
+    for root, dirs, files in os.walk(self.link_dir):
+      for path in files:
+        with open(path) as link:
+          orig = os.path.basename(path)
+          final = link.read().strip()
+          yield orig, final
+
+
 class UrlStore:
 
   def __init__(self, cache_dir):
     self.cache_dir = cache_dir
+    self.linker = UrlLink(cache_dir)
 
   def remove(self, url):
     """ remove url from cache """
@@ -35,13 +68,13 @@ class UrlStore:
     hx = self.hashurl(url)
     path = '%s.data' % hx
     dirname = hx[:2]
-    return os.path.join(URL_DIR, dirname, path)
+    return os.path.join(self.cache_dir, dirname, path)
 
   def url2headerpath(self, url):
     hx = self.hashurl(url)
     path = '%s.header' % hx
     dirname = hx[:2]
-    return os.path.join(URL_DIR, dirname, path)
+    return os.path.join(self.cache_dir, dirname, path)
 
   def paths(self, url):
     return self.url2datapath(url), self.url2headerpath(url)
@@ -50,16 +83,19 @@ class UrlStore:
     datapath, headerpath = self.paths(url)
     return os.path.exists(datapath) and os.path.exists(headerpath)
 
-  def _cache_get(self, url):
-    datapath, headerpath = self.paths(url)
+  def _response_from_files(self, datapath, headerpath):
     try:
       with open(datapath) as f:
         data = f.read()
       with open(headerpath) as f:
         headers = json.loads(f.read())
-      return Response(url, headers, data)
-    except IOError:
+    except IOError, e:
       return None
+    return Response(url, headers, data)
+
+  def _cache_get(self, url):
+    datapath, headerpath = self.paths(url)
+    return self._response_from_files(datapath, headerpath)
 
   def get(self, url):
     """ Get url from data store, downloading if necessary"""
@@ -85,10 +121,16 @@ class UrlStore:
         # Probably a bad URL
         return None
 
+    # Read URL and decorate response with some meta information.
     data = response.read()
     headers = response.info().dict
+    headers['x-original-url'] = url
+    headers['x-final-url'] = response.url
+    headers['x-fetch-date'] = time.time()
+    headers['x-fetch-code'] = response.code
 
-    datapath, headerpath = self.paths(url)
+    if url != response.url:
+      UrlLink(self.cache_dir).add(url, response.url)
 
     def make_cache_subdir(path):
       D = os.path.dirname(path)
@@ -96,6 +138,7 @@ class UrlStore:
         print 'making dir', D
         os.makedirs(D)
 
+    datapath, headerpath = self.paths(url)
     map(make_cache_subdir, [datapath, headerpath])
 
     with open(datapath, 'w') as cache:
@@ -106,80 +149,38 @@ class UrlStore:
 
     return Response(url, headers, data)
 
-def gen_index_urls():
-  for letter in 'abcdefghijklmnopqrstuvwxyz':
-    yield INDEX_URL_TEMPLATE % letter
+  def _gen_responses(self):
+    """ Generate all responses in cache_dir. """
+    for root, subs, files in os.walk(self.cache_dir):
+      for file in files:
+        if file.endswith('.header'):
+          base, ext = os.path.splitext(file)
+          headerpath = file
+          datapath = base + '.data'
+          if not os.path.exists(datapath):
+            raise CacheEntryError('Missing matching header or data')
+          return self._response_from_files(datapath, headerpath)
 
+  def gen_index():
+    """ Scan every file in cache and compile an index dict.  """
+    index = {}
+    for response in self._gen_responses():
+      url = response.headers['x-final-url']
+      index[url] = response
+    return index
 
 def bootstrap():
   if not os.path.exists(URL_DIR):
     os.makedirs(URL_DIR)
 
-class ResponseParser(object):
+def test():
+  url = 'http://cnn.com'
 
-  """ Take a response, yield new links and data """
-  def __init__(self, response):
-    self.response = response
-
-  def match(self):
-    raise NotImplementedError
-
-  def data(self):
-    yield
-
-  def links(self):
-    rx = re.compile('href="(.*?)"')
-    links = (m.group(1) for m in rx.finditer(self.response.data))
-    for link in links:
-      yield urlparse.urljoin(self.response.url, link)
-
-class IndexPageParser(ResponseParser):
-  def match(self):
-    return 'directory/teams' in self.response.url.lower()
-
-def main():
-  cache = UrlStore(URL_DIR)
-
-  # Seed with index urls.
-  index_urls = gen_index_urls()
-  for index_url in index_urls:
-    Q.append(index_url)
-
-  # Set up response parsers.
-  parsers = [
-    IndexPageParser
-  ]
-
-  class data:
-    urls = 0
-    bytes = 0
-
-  while len(Q):
-
-    if not len(Q):
-      print '.',
-      time.sleep(NAP_TIME)
-      continue
-
-    url = Q.pop()
-    response = cache.get(url)
-
-    if response:
-      data.urls += 1
-      data.bytes += len(response.data)
-      if data.urls % 100 == 0:
-        print 'urls:', data.urls, 'bytes:', data.bytes
-
-      for parser in parsers:
-        p = parser(response)
-        if p.match():
-          for link in p.links():
-            if link not in cache:
-              Q.append(link)
-          for patch in p.data():
-            pass
+  if not os.path.exists('.testcache'):
+    os.makedirs('.testcache')
+  url = UrlStore('.testcache')
+  url.get('http://cnn.com')
+  url.get('http://cnn.com')
 
 if __name__ == '__main__':
   bootstrap()
-
-  # main()
